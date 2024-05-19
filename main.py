@@ -1,27 +1,24 @@
 import os
 import sys
-from matplotlib import pyplot as plt
-import taichi as ti
-import numpy as np
-import pickle
 import time
+import pickle
+import numpy as np
+import taichi as ti
 
-from PIL import Image
 from tqdm import tqdm
+from PIL import Image
+from matplotlib import pyplot as plt
 
-real = ti.float32
-number = ti.int32
-scalar = lambda: ti.field(dtype=real)
-ndarray = ti.types.ndarray(dtype=real, needs_grad=False, boundary='unsafe')
+real = ti.f32
+number = ti.i32
 template = ti.template()
+scalar = lambda: ti.field(dtype=real)
+ndarray = ti.types.ndarray(dtype=real)
 
-ti.init(arch=ti.cuda,
-        default_ip=number,
+ti.init(arch=ti.vulkan,
         default_fp=real,
-        flatten_if=True,
-        random_seed=int(time.time()),
-        device_memory_GB=3.5,
-        default_gpu_block_dim=512)
+        default_ip=number,
+        random_seed=int(time.time()))
 
 
 @ti.func
@@ -32,12 +29,36 @@ def sigmoid(x: real) -> real:
 @ti.func
 def xavier(n_in: number, n_out: number) -> real:
     u = ti.sqrt(6 / (n_in + n_out))
+
+    # init range: [-u, +u]
     return 2 * ti.random(real) * u - u
 
 
 @ti.data_oriented
-class Net:
-    def __init__(self, input_size, cv_topology, fc_topology) -> None:
+class ConvNet:
+    def __init__(self, input_size: tuple, 
+                 cv_topology: list, 
+                 fc_topology: list) -> None:
+        """Initialize a CNN instance.
+
+        Args:
+            input_size: `tuple` - 3-dimensional size of the input layer.
+            cv_topology: `list` - Topology of the convolutional layers. 
+                                    Each layer must be a list of a 3-dimensional 
+                                    feature map size and a 2-dimensional filter size.
+            fc_topology: `list` - Topology of the fully connected layers.
+                                    Each layer must be a number of neurons it contains.
+
+        Example::
+
+            >>> net = ConvNet(
+            >>>     input_size=(64, 64, 3),
+            >>>     cv_topology=[[(30, 30, 6), (3, 3)],
+            >>>                  [(14, 14, 3), (3, 3)]],
+            >>>     fc_topology=[64, 2]
+            >>> )
+        """
+
         self.input_size = input_size
         self.cv_topology = cv_topology
         self.fc_topology = fc_topology
@@ -123,6 +144,19 @@ class Net:
 
     @property
     def param_count(self):
+        """Return a total number of a CNN instance's parameters
+        
+        Example::
+
+            >>> net = ConvNet(
+            >>>     input_size=(64, 64, 3),
+            >>>     cv_topology=[[(30, 30, 6), (3, 3)],
+            >>>                  [(14, 14, 3), (3, 3)]],
+            >>>     fc_topology=[64, 2]
+            >>> )
+            >>> print(net.param_count)  # 38159
+            """
+
         total = 0
 
         for fc_weights in self.fc_weights:
@@ -140,6 +174,16 @@ class Net:
         return total
     
     def dump_params(self, url: str = 'params.net'):
+        """Save a CNN instance's parameters.
+
+        Args:
+            url: `str` - path to the file to save the parameters.
+
+        Example::
+
+            >>> net.dump_params('params.net')
+        """
+
         cv_biases = []
         cv_filters = []
         fc_biases = []
@@ -164,6 +208,16 @@ class Net:
             pickle.dump(params, f)
 
     def load_params(self, url: str = 'params.net'):
+        """Load a CNN instance's parameters.
+        
+        Args:
+            url: `str` - path to the file to load the parameters.
+
+        Example::
+
+            >>> net.load_params('params.net')
+        """
+
         with open(url, 'rb') as f:
             params = pickle.load(f)
 
@@ -187,6 +241,7 @@ class Net:
         fcWs = ti.static(self.fc_weights)
 
         # Xavier Initialization -->
+        # 
         for l in ti.static(range(len(cvFs))):
             for fl in range(cvFs[l].shape[0]):
                 for wX, wY, wZ in ti.ndrange(cvFs[l].shape[1], 
@@ -215,7 +270,6 @@ class Net:
 
         for O in ti.grouped(cvMs[0]):
             cvMs[0].grad[O] = 0.
-
         for l in ti.static(range(len(cvMs_raw))):
             for fl in range(cvFs[l].shape[0]):
                 cvBs[l].grad[fl] = 0.
@@ -223,16 +277,13 @@ class Net:
                                              cvFs[l].shape[2],
                                              cvFs[l].shape[3]):
                     cvFs[l].grad[fl, wX, wY, wZ] = 0.
-
             for O in ti.grouped(cvMs_raw[l]):
                 cvMs_raw[l].grad[O] = 0.
-
             for O in ti.grouped(cvMs[l+1]):
                 cvMs[l+1].grad[O] = 0.
 
         for n in fcOs[0]:
             fcOs[0].grad[n] = 0.
-            
         for l in ti.static(range(len(fcOs_raw))):
             for n in range(fcWs[l].shape[0]):
                 fcBs[l].grad[n] = 0.
@@ -252,45 +303,60 @@ class Net:
         fcWs = ti.static(self.fc_weights)
         fcBs = ti.static(self.fc_biases)
 
+        # loop over conv layers
         for l in ti.static(range(len(cvMs_raw))):
-            cfX = ti.static(cvMs_raw[l].shape[0] // cvMs[l+1].shape[0])
-            cfY = ti.static(cvMs_raw[l].shape[1] // cvMs[l+1].shape[1])
-
+            # loop over feature raw map coords (x, y, z)
+            # to calculate the layer's weighted sum
             for O in ti.grouped(cvMs_raw[l]):
                 cvMs_raw[l][O] = 0.
+                # loop over filter coords (x, y, z)
                 for fX, fY, fZ in ti.ndrange(cvFs[l].shape[1],
                                              cvFs[l].shape[2],
                                              cvFs[l].shape[3]):
-                    iX = O.x + fX
-                    iY = O.y + fY
-                    cvMs_raw[l][O] += cvFs[l][O.z, fX, fY, fZ] * cvMs[l][iX, iY, fZ] / 255
+                    iX = O.x + fX  # input X
+                    iY = O.y + fY  # input Y
+                    cvMs_raw[l][O] += cvFs[l][O.z, fX, fY, fZ] * cvMs[l][iX, iY, fZ]
             
+            # X compression factor
+            cfX = ti.static(cvMs_raw[l].shape[0] // cvMs[l+1].shape[0])
+            # Y compression factor
+            cfY = ti.static(cvMs_raw[l].shape[1] // cvMs[l+1].shape[1])
+
+            # loop over feature map coords (x, y, z)
+            # to activate the weighted sum
             for O in ti.grouped(cvMs[l+1]):
-                _max = 0.
+                _max = 0.  # init max as zero
                 for mX, mY in ti.ndrange(cfX, cfY):
-                    iX = O.x * cfX + mX
-                    iY = O.y * cfY + mY
-                    _max = max(0, _max, cvMs_raw[l][iX, iY, O.z] + cvBs[l][O.z])
+                    rX = O.x * cfX + mX  # raw X
+                    rY = O.y * cfY + mY  # raw Y
+                    # ReLU + maxpooling inlined
+                    _max = max(_max, cvMs_raw[l][rX, rY, O.z] + cvBs[l][O.z])
                 cvMs[l+1][O] = _max
 
+        # flatten the convolutional output
         for I in ti.grouped(cvMs[-1]):
-            idx = I.x * cvMs[-1].shape[1] * cvMs[-1].shape[2] + I.y * cvMs[-1].shape[2] + I.z
-            fcOs[0][idx] = cvMs[-1][I]
+            # flatten index is x * width * depth + y * depth + z
+            fI = I.x * cvMs[-1].shape[1] * cvMs[-1].shape[2] + I.y * cvMs[-1].shape[2] + I.z
+            fcOs[0][fI] = cvMs[-1][I]
 
+        # loop over fully connected layers
         for l in ti.static(range(len(fcWs))):
+            # loop over neurons
+            # to calculate the layer's weighted sum
             for n in range(fcWs[l].shape[0]):
                 fcOs_raw[l][n] = 0.
+                # loop over neuron weights
                 for w in range(fcWs[l].shape[1]):
                     fcOs_raw[l][n] += fcWs[l][n, w] * fcOs[l][w]
+            # loop over neurons
+            # to activate the weighted sum
             for n in range(fcWs[l].shape[0]):
                 fcOs[l+1][n] = sigmoid(fcOs_raw[l][n] + fcBs[l][n])
 
     @ti.kernel
     def _copy_input(self, entry: ndarray):
-        input_map = ti.static(self.cv_maps[0])
-
         for I in ti.grouped(entry):
-            input_map[I] = entry[I]
+            self.cv_maps[0][I] = entry[I]
 
     @ti.kernel
     def _copy_target(self, ideal: ndarray):
@@ -303,9 +369,9 @@ class Net:
         actual = ti.static(self.fc_outputs[-1])
 
         for n in actual:
-            l = (ideal[n] - actual[n]) ** 2 / actual.shape[0]
-            self._loss[None] += l
-            self._history[epoch] += l
+            L = (ideal[n] - actual[n]) ** 2 / actual.shape[0]
+            self._loss[None] += L
+            self._history[epoch] += L
 
     @ti.kernel
     def _advance(self):
@@ -317,28 +383,70 @@ class Net:
 
         for l in ti.static(range(len(cvFs))):
             for fl in range(cvFs[l].shape[0]):
+                # new_bias = old_bias - lr * dL_dB
                 cvBs[l][fl] -= lr * cvBs[l].grad[fl]
                 for wX, wY, wZ in ti.ndrange(cvFs[l].shape[1], 
                                              cvFs[l].shape[2],
                                              cvFs[l].shape[3]):
+                    # new_weight = old_weight - lr * dL_dW
                     cvFs[l][fl, wX, wY, wZ] -= lr * cvFs[l].grad[fl, wX, wY, wZ]
 
         for l in ti.static(range(len(fcWs))):
             for n in range(fcWs[l].shape[0]):
+                # new_bias = old_bias - lr * dL_dB
                 fcBs[l][n] -= lr * fcBs[l].grad[n]
                 for w in range(fcWs[l].shape[1]):
+                    # new_weight = old_weight - lr * dL_dW
                     fcWs[l][n, w] -= lr * fcWs[l].grad[n, w]
 
-    def predict(self, entry):
-        self.cv_maps[0].from_numpy(entry)
+    def predict(self, entry: ndarray) -> np.ndarray:
+        """Pass the entry through the CNN instance and 
+        return the very last fully connected layer output.
+
+        Args:
+            entry: `ndarray`
+        Returns:
+            output: `np.ndarray`
+
+        Example::
+
+            >>> entry = np.array(...)
+            >>> res = net.predict(entry)
+            >>> print(res)
+        """
+
+        self._copy_input(entry)
         self._forward()
         
         ti.sync()
         return self.fc_outputs[-1].to_numpy()
     
     def train(self, samples, targets, epochs=1000, batch_size=4, learn_rate=0.1):
-        self._learn_rate = learn_rate
+        """Train a CNN instance.
 
+        Args:
+            samples: `ndarray` - samples to train the model.
+            targets: `ndarray` - sample markers to train the model.
+            epochs: `int` - number of epochs.
+            batch_size: `int` - size of a batch.
+            learn_rate: `float` - learn rate.
+        Returns:
+            history: `np.ndarray` - loss history
+
+        Example::
+
+            >>> history = net.train(
+            >>>     samples=samples, 
+            >>>     targets=targets,
+            >>>     epochs=150,
+            >>>     batch_size=64,
+            >>>     learn_rate=0.01
+            >>> )
+            >>> plt.plot(history)
+            >>> plt.show()
+        """
+
+        self._learn_rate = learn_rate
         self._history = scalar()
         ti.root.dense(ti.i, epochs).place(self._history)
 
@@ -350,7 +458,6 @@ class Net:
                           unit=' epochs ',
                           desc='Training process: ',
                           colour='green'):
-        # for epoch in range(epochs):
             self._clear_grads()
             for sample in batches[epoch]:
                 self._copy_input(samples[sample])
@@ -364,16 +471,18 @@ class Net:
             # params correction
             self._advance()
 
-            # ti.sync()
+            ti.sync()
 
         return self._history.to_numpy()
 
 if __name__ == "__main__":
-    net = Net(input_size=(64, 64, 3),
-              cv_topology=[((30, 30, 24), (3, 3)),
-                           ((14, 14, 12), (3, 3))],
-              fc_topology=[64, 2])
-    print(net.param_count)
+    net = ConvNet(
+        input_size=(64, 64, 3),
+        cv_topology=[[(30, 30, 6), (3, 3)],
+                     [(14, 14, 3), (3, 3)]],
+        fc_topology=[64, 2]
+    )
+    print(net.param_count)  # 38159
 
     # net.load_params()
 
@@ -402,22 +511,23 @@ if __name__ == "__main__":
     tr2 = [[0., 1.] for _ in range(len(scaled_images2))]
     trues = np.array(tr1 + tr2, dtype=np.float32)
 
-    history = net.train(samples=dataset, 
-                        targets=trues,
-                        epochs=1000,
-                        batch_size=32,
-                        learn_rate=0.01)
-    
-    # net.dump_params()
+    print(net.predict(scaled_images1[0]))
+    print(net.predict(scaled_images2[0]))
+    print(net.predict(scaled_images1[-1]))
+    print(net.predict(scaled_images2[-1]))
 
-    # print(net.predict(inarr1))
-    # print(net.predict(inarr2))
-    # print(net.predict(inarr3))
-    # print(net.predict(inarr4))
-    print(net.predict(scaled_images1[0] / 255))
-    print(net.predict(scaled_images2[0] / 255))
-    print(net.predict(scaled_images1[-1] / 255))
-    print(net.predict(scaled_images2[-1] / 255))
+    history = net.train(samples=dataset[:10], 
+                        targets=trues[:10],
+                        epochs=100,
+                        batch_size=1,
+                        learn_rate=0.5)
+    
+    net.dump_params()
+
+    print(net.predict(scaled_images1[0]))
+    print(net.predict(scaled_images2[0]))
+    print(net.predict(scaled_images1[-1]))
+    print(net.predict(scaled_images2[-1]))
 
     plt.plot(net._history)
     plt.show()
