@@ -8,13 +8,13 @@ from tqdm import tqdm
 from PIL import Image
 from matplotlib import pyplot as plt
 
-real = ti.f32
+real = ti.f64
 number = ti.i32
 template = ti.template()
 scalar = lambda: ti.field(dtype=real)
 ndarray = ti.types.ndarray(dtype=real)
 
-ti.init(arch=ti.vulkan,
+ti.init(arch=ti.cuda,
         default_fp=real,
         default_ip=number)
 
@@ -374,13 +374,13 @@ class ConvNet:
                 fcOs[l+1][n] = sigmoid(fcOs_raw[l][n] + fcBs[l][n])
 
     @ti.kernel
-    def _compute_loss(self, penalty: real):
+    def _compute_loss(self):
         ideal = ti.static(self._target)
         actual = ti.static(self.fc_outputs[-1])
 
         for n in range(actual.shape[0]):
             L = ideal[n] * ti.log(actual[n]) + (1 - ideal[n]) * ti.log(1 - actual[n])
-            self._loss[n] = -(L + penalty)
+            self._loss[n] = -(L + self._penalty) 
 
     @ti.kernel
     def _advance(self):
@@ -431,11 +431,17 @@ class ConvNet:
         ti.sync()
         return self.fc_outputs[-1].to_numpy()
     
-    def train(self, dataset_path: str, epochs: int = 1000, history_interval: int = 10, learn_rate: float = 0.1, l2_lambda: float = 0.01):
+    def train(self, training_url: str, 
+              epochs: int = 1000, 
+              history_interval: int = 10, 
+              dump_interval: int = 100, 
+              dump_url: str = 'params.net',
+              learn_rate: float = 0.1, 
+              l2_lambda: float = 0.01):
         """Train a CNN instance.
 
         Args:
-            dataset_path: `str` - path to the dataset.
+            training_url: `str` - path to the dataset.
             epochs: `int` - number of epochs.
             batch_size: `int` - size of a batch.
             learn_rate: `float` - learn rate.
@@ -456,65 +462,70 @@ class ConvNet:
         """
 
         self._learn_rate = learn_rate
+        self._penalty = 0.0
+
         history = np.zeros(shape=(epochs // history_interval), dtype=np.float32)
 
         imgs = []
         lbls = []
 
-        groups = os.listdir(dataset_path)
+        groups = os.listdir(training_url)
         groups_num = len(groups)
+        param_count = self.param_count
 
         for i in tqdm(range(groups_num), 
                       file=sys.stdout, 
                       unit=' classes ',
                       desc='Collecting dataset: ',
                       colour='green'):
-            group_path = os.path.join(dataset_path, groups[i])
+            group_path = os.path.join(training_url, groups[i])
 
             for filename in os.listdir(group_path):
-                image_label = np.array([0. for _ in range(groups_num)], dtype=np.float32)
+                image_label = np.array([0. for _ in range(groups_num)], dtype=np.float64)
                 image_label[i] = 1.
 
                 try:
                     with Image.open(os.path.join(group_path, filename)) as image:
-                        image_array = np.array(image.resize((64, 64)).convert('RGB'), dtype=np.float32) / 255
+                        image_array = np.array(image.resize((64, 64)).convert('RGB'), dtype=np.float64) / 255
                 except:
                     pass
 
                 imgs.append(image_array)
                 lbls.append(image_label)
 
-        batches = np.random.randint(0, len(imgs), size=epochs)
+        idxs = np.random.randint(0, len(imgs), size=epochs)
 
         for epoch in tqdm(range(epochs), 
                           file=sys.stdout, 
                           unit=' epochs ',
                           desc=f'Training progress: ',
                           colour='green'):
-            sample = batches[epoch]
+            self._penalty = (self._param_sqsum() / param_count) * l2_lambda
+            self.cv_maps[0].from_numpy(imgs[idxs[epoch]])
+            self._target.from_numpy(lbls[idxs[epoch]])
+
             self._clear_grads()
-            penalty = (self._param_sqsum() / self._param_count()) * l2_lambda
-
-            self.cv_maps[0].from_numpy(imgs[sample])
-            self._target.from_numpy(lbls[sample])
-
+            # forward pass
             self._forward()
-            self._compute_loss(penalty)
-            self._compute_loss.grad(penalty)
+            self._compute_loss()
+            # backward pass
+            self._compute_loss.grad()
             self._forward.grad()
-
             # params correction
             self._advance()
 
-            history[epoch // history_interval] += (self._loss[0] + self._loss[1] + self._loss[2] + self._loss[3]) / 4 / history_interval
+            history[epoch // history_interval] += self._loss.to_numpy().mean() / history_interval
+
+            if epoch % dump_interval == 0:
+                self.dump_params(dump_url)
 
         return history
     
-    def compute_accuracy(self, dataset_path: str):
+    def compute_accuracy(self, training_url: str):
         """Calculate the approximate accuracy of the model.
 
         Args:
-            dataset_path: `str` - path to the dataset.
+            training_url: `str` - path to the dataset.
         Returns:
             accuracy: `float` - approximate accuracy
 
@@ -525,19 +536,19 @@ class ConvNet:
             >>> 0.87921
         """
 
-        groups = os.listdir(dataset_path)
+        groups = os.listdir(training_url)
         groups_num = len(groups)
 
-        results = np.zeros(shape=groups_num, dtype=np.float32)
+        results = np.zeros(shape=groups_num, dtype=np.float64)
 
         for i in tqdm(range(groups_num), 
                       file=sys.stdout, 
                       unit=' classes ',
                       desc='Validation progress: ',
                       colour='blue'):
-            group_path = os.path.join(dataset_path, groups[i])
+            group_path = os.path.join(training_url, groups[i])
             group_samples_num = len(os.listdir(group_path))
-            group_res = np.zeros(group_samples_num, dtype=np.float32)
+            group_res = np.zeros(group_samples_num, dtype=np.float64)
 
             for sample in range(group_samples_num):
                 try:
@@ -557,25 +568,23 @@ class ConvNet:
 if __name__ == "__main__":
     net = ConvNet(
         input_size=(64, 64, 3),
-        cv_topology=[[(30, 30, 15), (3, 3)],
-                     [(14, 14, 30), (5, 5)]],
-        fc_topology=[128, 4]
+        cv_topology=[[(30, 30, 32), (3, 3)],
+                     [(14, 14, 64), (5, 5)]],
+        fc_topology=[512, 64, 10]
     )
-    print(net.param_count)
-    print(net._param_sqsum() / net._param_count())
+    print(net.param_count)  # 6508682
     
     # net.load_params()
 
-    history = net.train(dataset_path='dataset',
-                        epochs=100000,
-                        history_interval=1000,
-                        learn_rate=0.0005,
-                        l2_lambda=2.0)
+    history = net.train(training_url='dataset/training',
+                        epochs=10000,
+                        history_interval=100,
+                        dump_interval=250,
+                        dump_url='params.net',
+                        learn_rate=0.005,
+                        l2_lambda=0.05)
 
-    print(net.compute_accuracy('dataset'))
-
-    # trues = np.array([[i] for i in range(16)])
-    # plt.plot(validation_results)
+    print(net.compute_accuracy('dataset/training'))
 
     plt.plot(history)
     plt.show()
