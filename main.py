@@ -116,8 +116,8 @@ class ConvNet:
 
             fc_output = scalar()
             fc_output_raw = scalar()
-            fc_biases = scalar()
             fc_weights = scalar()
+            fc_biases = scalar()
 
             neuron_block = ti.root.dense(ti.i, neurons_num) 
             neuron_block.place(fc_output_raw, fc_output, fc_biases)
@@ -128,7 +128,7 @@ class ConvNet:
             self.fc_biases.append(fc_biases)
             self.fc_weights.append(fc_weights)
 
-        ti.root.place(self._loss)
+        ti.root.dense(ti.i, self.fc_topology[-1]).place(self._loss)
         ti.root.dense(ti.i, self.fc_topology[-1]).place(self._target)
         ti.root.lazy_grad()
 
@@ -140,28 +140,15 @@ class ConvNet:
 
             >>> net = ConvNet(
             >>>     input_size=(64, 64, 3),
-            >>>     cv_topology=[[(30, 30, 6), (3, 3)],
-            >>>                  [(14, 14, 3), (3, 3)]],
-            >>>     fc_topology=[64, 2]
+            >>>     cv_topology=[[(30, 30, 32), (3, 3)],
+            >>>                  [(14, 14, 64), (5, 5)]],
+            >>>     fc_topology=[512, 32, 4]
             >>> )
-            >>> print(net.param_count)  # 38159
+            >>> print(net.param_count)
+            >>> 6491748
             """
 
-        total = 0
-
-        for fc_weights in self.fc_weights:
-            total += fc_weights.shape[0] * fc_weights.shape[1]
-
-        for fc_biases in self.fc_biases:
-            total += fc_biases.shape[0]
-
-        for cv_filters in self.cv_filters:
-            total += cv_filters.shape[0] * cv_filters.shape[1] * cv_filters.shape[2] * cv_filters.shape[3]
-
-        for cv_biases in self.cv_biases:
-            total += cv_biases.shape[0]
-
-        return total
+        return self._param_count()
     
     def dump_params(self, url: str = 'params.net'):
         """Save a CNN instance's parameters.
@@ -230,19 +217,62 @@ class ConvNet:
         fcWs = ti.static(self.fc_weights)
 
         for l in ti.static(range(len(cvFs))):
-            u = 1 / ti.sqrt(cvFs[l].shape[0] * 
-                            cvFs[l].shape[1] * 
-                            cvFs[l].shape[2] * 
-                            cvFs[l].shape[3])
+            u = ti.sqrt(6 / (cvFs[l].shape[0] + cvFs[l].shape[3]))
             for F in ti.grouped(cvFs[l]):
                 cvFs[l][F] = 2 * ti.random(real) * u - u
 
         for l in ti.static(range(len(fcWs))):
-            u = 1 / ti.sqrt(fcWs[l].shape[0] * 
-                            fcWs[l].shape[1])
+            u = ti.sqrt(6 / (fcWs[l].shape[0] + fcWs[l].shape[1]))
             for W in ti.grouped(fcWs[l]):
                 fcWs[l][W] = 2 * ti.random(real) * u - u
 
+    @ti.kernel
+    def _param_count(self) -> number:
+        cvFs = ti.static(self.cv_filters)
+        cvBs = ti.static(self.cv_biases)
+        fcWs = ti.static(self.fc_weights)
+        fcBs = ti.static(self.fc_biases)
+
+        total = 0
+
+        for l in ti.static(range(len(fcWs))):
+            total += fcWs[l].shape[0] * fcWs[l].shape[1]
+
+        for l in ti.static(range(len(fcBs))):
+            total += fcBs[l].shape[0]
+
+        for l in ti.static(range(len(cvFs))):
+            total += cvFs[l].shape[0] * cvFs[l].shape[1] * cvFs[l].shape[2] * cvFs[l].shape[3]
+
+        for l in ti.static(range(len(cvBs))):
+            total += cvBs[l].shape[0]
+
+        return total
+    
+    @ti.kernel
+    def _param_sqsum(self) -> real:
+        cvFs = ti.static(self.cv_filters)
+        cvBs = ti.static(self.cv_biases)
+        fcWs = ti.static(self.fc_weights)
+        fcBs = ti.static(self.fc_biases)
+
+        _sum = 0.
+        for l in ti.static(range(len(cvFs))):
+            for fL in range(cvFs[l].shape[0]):
+                _sum += cvBs[l][fL] ** 2
+                for fX, fY, fZ in ti.ndrange(cvFs[l].shape[1],
+                                             cvFs[l].shape[2],
+                                             cvFs[l].shape[3]):
+                    _sum += cvFs[l][fL, fX, fY, fZ] ** 2
+
+        for l in ti.static(range(len(fcWs))):
+            for n in range(fcWs[l].shape[0]):
+                _sum += fcBs[l][n] ** 2
+                for w in range(fcWs[l].shape[1]):
+                    _sum += fcWs[l][n, w] ** 2
+
+        return _sum
+    
     @ti.kernel
     def _clear_grads(self):
         cvMs = ti.static(self.cv_maps)
@@ -254,8 +284,9 @@ class ConvNet:
         fcWs = ti.static(self.fc_weights)
         fcBs = ti.static(self.fc_biases)
 
-        self._loss[None] = 0.
-        self._loss.grad[None] = 1.
+        for n in self._loss:
+            self._loss[n] = 0.
+            self._loss.grad[n] = 1.
 
         for O in ti.grouped(cvMs[0]):
             cvMs[0].grad[O] = 0.
@@ -343,24 +374,13 @@ class ConvNet:
                 fcOs[l+1][n] = sigmoid(fcOs_raw[l][n] + fcBs[l][n])
 
     @ti.kernel
-    def _copy_input(self, entry: ndarray):
-        for I in ti.grouped(entry):
-            self.cv_maps[0][I] = entry[I]
-
-    @ti.kernel
-    def _copy_target(self, ideal: ndarray):
-        for n in ideal:
-            self._target[n] = ideal[n]
-
-    @ti.kernel
-    def _compute_loss(self, epoch: number, batch_size: number):
+    def _compute_loss(self, penalty: real):
         ideal = ti.static(self._target)
         actual = ti.static(self.fc_outputs[-1])
 
         for n in range(actual.shape[0]):
             L = ideal[n] * ti.log(actual[n]) + (1 - ideal[n]) * ti.log(1 - actual[n])
-            self._loss[None] -= L / (actual.shape[0] * batch_size)
-            self._loss_history[epoch] -= L / (actual.shape[0] * batch_size)
+            self._loss[n] = -(L + penalty)
 
     @ti.kernel
     def _advance(self):
@@ -402,16 +422,16 @@ class ConvNet:
             >>> entry = np.array(...)
             >>> res = net.predict(entry)
             >>> print(res)
+            >>> [0.17293, 0.97124, ... ]
         """
 
-        _entry = (entry - entry.min()) / (entry.max() - entry.min())
-        self._copy_input(_entry)
+        self.cv_maps[0].from_numpy(entry / 255)
         self._forward()
         
         ti.sync()
         return self.fc_outputs[-1].to_numpy()
     
-    def train(self, dataset_path: str, epochs: int = 1000, learn_rate: float = 0.1):
+    def train(self, dataset_path: str, epochs: int = 1000, history_interval: int = 10, learn_rate: float = 0.1, l2_lambda: float = 0.01):
         """Train a CNN instance.
 
         Args:
@@ -436,11 +456,10 @@ class ConvNet:
         """
 
         self._learn_rate = learn_rate
-        self._loss_history = scalar()
-        ti.root.dense(ti.i, epochs).place(self._loss_history)
+        history = np.zeros(shape=(epochs // history_interval), dtype=np.float32)
 
-        imgs = [[] for _ in range(self.fc_topology[-1])]
-        lbls = [[] for _ in range(self.fc_topology[-1])]
+        imgs = []
+        lbls = []
 
         groups = os.listdir(dataset_path)
         groups_num = len(groups)
@@ -456,65 +475,107 @@ class ConvNet:
                 image_label = np.array([0. for _ in range(groups_num)], dtype=np.float32)
                 image_label[i] = 1.
 
-                image = Image.open(os.path.join(group_path, filename))
-                image_array = np.array(image.resize((64, 64)).convert('RGB'), dtype=np.float32) / 255
+                try:
+                    with Image.open(os.path.join(group_path, filename)) as image:
+                        image_array = np.array(image.resize((64, 64)).convert('RGB'), dtype=np.float32) / 255
+                except:
+                    pass
 
-                imgs[i].append(image_array)
-                lbls[i].append(image_label)
+                imgs.append(image_array)
+                lbls.append(image_label)
 
-        batches = np.array([np.random.randint(0, len(imgs[i]), size=(epochs)) for i in range(groups_num)])
+        batches = np.random.randint(0, len(imgs), size=epochs)
 
         for epoch in tqdm(range(epochs), 
                           file=sys.stdout, 
                           unit=' epochs ',
-                          desc='Training process: ',
+                          desc=f'Training progress: ',
                           colour='green'):
+            sample = batches[epoch]
             self._clear_grads()
-            for sample in range(groups_num):
-                self._copy_input(imgs[sample][batches[sample, epoch]])
-                self._copy_target(lbls[sample][batches[sample, epoch]])
-                # forward pass
-                self._forward()
-                self._compute_loss(epoch, groups_num)
-                # backward pass
-                self._compute_loss.grad(epoch, groups_num)
-                self._forward.grad()
+            penalty = (self._param_sqsum() / self._param_count()) * l2_lambda
+
+            self.cv_maps[0].from_numpy(imgs[sample])
+            self._target.from_numpy(lbls[sample])
+
+            self._forward()
+            self._compute_loss(penalty)
+            self._compute_loss.grad(penalty)
+            self._forward.grad()
+
             # params correction
             self._advance()
-            
-            ti.sync()
 
-        return self._loss_history.to_numpy()
+            history[epoch // history_interval] += (self._loss[0] + self._loss[1] + self._loss[2] + self._loss[3]) / 4 / history_interval
+
+        return history
+    
+    def compute_accuracy(self, dataset_path: str):
+        """Calculate the approximate accuracy of the model.
+
+        Args:
+            dataset_path: `str` - path to the dataset.
+        Returns:
+            accuracy: `float` - approximate accuracy
+
+        Example::
+
+            >>> accuracy = net.compute_accuracy('dataset')
+            >>> print(accuracy)
+            >>> 0.87921
+        """
+
+        groups = os.listdir(dataset_path)
+        groups_num = len(groups)
+
+        results = np.zeros(shape=groups_num, dtype=np.float32)
+
+        for i in tqdm(range(groups_num), 
+                      file=sys.stdout, 
+                      unit=' classes ',
+                      desc='Validation progress: ',
+                      colour='blue'):
+            group_path = os.path.join(dataset_path, groups[i])
+            group_samples_num = len(os.listdir(group_path))
+            group_res = np.zeros(group_samples_num, dtype=np.float32)
+
+            for sample in range(group_samples_num):
+                try:
+                    with Image.open(os.path.join(group_path, os.listdir(group_path)[sample])) as image:
+                        image_array = np.array(image.resize((64, 64)).convert('RGB'), dtype=np.float32) / 255
+                        self.cv_maps[0].from_numpy(image_array)
+                        self._forward()
+                        group_res[sample] = self.fc_outputs[-1].to_numpy().argmax()
+                except:
+                    pass
+
+            results[i] = np.sum(group_res == i) / group_samples_num
+
+        return results.mean()
+
 
 if __name__ == "__main__":
     net = ConvNet(
         input_size=(64, 64, 3),
-        cv_topology=[[(30, 30, 32), (3, 3)],  # max-pooling 2x2
-                     [(14, 14, 64), (3, 3)]],  # max-pooling 2x2
-        fc_topology=[256, 32, 16]
+        cv_topology=[[(30, 30, 15), (3, 3)],
+                     [(14, 14, 30), (5, 5)]],
+        fc_topology=[128, 4]
     )
-    print(net.param_count)  # 3239268
-
+    print(net.param_count)
+    print(net._param_sqsum() / net._param_count())
+    
     # net.load_params()
 
     history = net.train(dataset_path='dataset',
-                        epochs=10000,
-                        learn_rate=0.01)
-    
-    net.dump_params()
-    t_images = [
-        Image.open('dataset/cloudy/cloudy1.jpg').resize((64, 64)).convert('RGB'),
-        Image.open('dataset/dew/2208.jpg').resize((64, 64)).convert('RGB'),
-        Image.open('dataset/foggy/foggy1.jpg').resize((64, 64)).convert('RGB'),
-        Image.open('dataset/fogsmog/4075.jpg').resize((64, 64)).convert('RGB'),
-    ]
+                        epochs=100000,
+                        history_interval=1000,
+                        learn_rate=0.0005,
+                        l2_lambda=2.0)
 
-    t_arrays = [np.array(t_image, dtype=np.float32) for t_image in t_images]
+    print(net.compute_accuracy('dataset'))
 
-    print(net.predict(t_arrays[0]))
-    print(net.predict(t_arrays[1]))
-    print(net.predict(t_arrays[2]))
-    print(net.predict(t_arrays[3]))
+    # trues = np.array([[i] for i in range(16)])
+    # plt.plot(validation_results)
 
     plt.plot(history)
     plt.show()
