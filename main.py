@@ -1,6 +1,5 @@
 import os
 import sys
-import time
 import pickle
 import numpy as np
 import taichi as ti
@@ -17,21 +16,12 @@ ndarray = ti.types.ndarray(dtype=real)
 
 ti.init(arch=ti.vulkan,
         default_fp=real,
-        default_ip=number,
-        random_seed=int(time.time()))
+        default_ip=number)
 
 
 @ti.func
 def sigmoid(x: real) -> real:
     return 1 / (1 + ti.exp(-x))
-
-
-@ti.func
-def xavier(n_in: number, n_out: number) -> real:
-    u = ti.sqrt(6 / (n_in + n_out))
-
-    # init range: [-u, +u]
-    return 2 * ti.random(real) * u - u
 
 
 @ti.data_oriented
@@ -138,8 +128,8 @@ class ConvNet:
             self.fc_biases.append(fc_biases)
             self.fc_weights.append(fc_weights)
 
-        ti.root.dense(ti.i, self.fc_topology[-1]).place(self._target)
         ti.root.place(self._loss)
+        ti.root.dense(ti.i, self.fc_topology[-1]).place(self._target)
         ti.root.lazy_grad()
 
     @property
@@ -236,23 +226,22 @@ class ConvNet:
 
     @ti.kernel
     def _init_params(self):
-        cvMs = ti.static(self.cv_maps)
         cvFs = ti.static(self.cv_filters)
         fcWs = ti.static(self.fc_weights)
 
-        # Xavier Initialization -->
-        # 
         for l in ti.static(range(len(cvFs))):
-            for fl in range(cvFs[l].shape[0]):
-                for wX, wY, wZ in ti.ndrange(cvFs[l].shape[1], 
-                                             cvFs[l].shape[2],
-                                             cvFs[l].shape[3]):
-                    cvFs[l][fl, wX, wY, wZ] = xavier(cvMs[l].shape[2], cvFs[l].shape[3])
+            u = 1 / ti.sqrt(cvFs[l].shape[0] * 
+                            cvFs[l].shape[1] * 
+                            cvFs[l].shape[2] * 
+                            cvFs[l].shape[3])
+            for F in ti.grouped(cvFs[l]):
+                cvFs[l][F] = 2 * ti.random(real) * u - u
 
         for l in ti.static(range(len(fcWs))):
-            for n in range(fcWs[l].shape[0]):
-                for w in range(fcWs[l].shape[1]):
-                    fcWs[l][n, w] = xavier(fcWs[l].shape[1], fcWs[l].shape[0])
+            u = 1 / ti.sqrt(fcWs[l].shape[0] * 
+                            fcWs[l].shape[1])
+            for W in ti.grouped(fcWs[l]):
+                fcWs[l][W] = 2 * ti.random(real) * u - u
 
     @ti.kernel
     def _clear_grads(self):
@@ -265,8 +254,8 @@ class ConvNet:
         fcWs = ti.static(self.fc_weights)
         fcBs = ti.static(self.fc_biases)
 
-        self._loss[None] = 0
-        self._loss.grad[None] = 1
+        self._loss[None] = 0.
+        self._loss.grad[None] = 1.
 
         for O in ti.grouped(cvMs[0]):
             cvMs[0].grad[O] = 0.
@@ -364,14 +353,14 @@ class ConvNet:
             self._target[n] = ideal[n]
 
     @ti.kernel
-    def _compute_loss(self, epoch: number):
+    def _compute_loss(self, epoch: number, batch_size: number):
         ideal = ti.static(self._target)
         actual = ti.static(self.fc_outputs[-1])
 
-        for n in actual:
-            L = (ideal[n] - actual[n]) ** 2 / actual.shape[0]
-            self._loss[None] += L
-            self._history[epoch] += L
+        for n in range(actual.shape[0]):
+            L = ideal[n] * ti.log(actual[n]) + (1 - ideal[n]) * ti.log(1 - actual[n])
+            self._loss[None] -= L / (actual.shape[0] * batch_size)
+            self._loss_history[epoch] -= L / (actual.shape[0] * batch_size)
 
     @ti.kernel
     def _advance(self):
@@ -399,7 +388,7 @@ class ConvNet:
                     # new_weight = old_weight - lr * dL_dW
                     fcWs[l][n, w] -= lr * fcWs[l].grad[n, w]
 
-    def predict(self, entry: ndarray) -> np.ndarray:
+    def predict(self, entry: np.ndarray) -> np.ndarray:
         """Pass the entry through the CNN instance and 
         return the very last fully connected layer output.
 
@@ -415,18 +404,18 @@ class ConvNet:
             >>> print(res)
         """
 
-        self._copy_input(entry)
+        _entry = (entry - entry.min()) / (entry.max() - entry.min())
+        self._copy_input(_entry)
         self._forward()
         
         ti.sync()
         return self.fc_outputs[-1].to_numpy()
     
-    def train(self, samples, targets, epochs=1000, batch_size=4, learn_rate=0.1):
+    def train(self, dataset_path: str, epochs: int = 1000, learn_rate: float = 0.1):
         """Train a CNN instance.
 
         Args:
-            samples: `ndarray` - samples to train the model.
-            targets: `ndarray` - sample markers to train the model.
+            dataset_path: `str` - path to the dataset.
             epochs: `int` - number of epochs.
             batch_size: `int` - size of a batch.
             learn_rate: `float` - learn rate.
@@ -447,11 +436,33 @@ class ConvNet:
         """
 
         self._learn_rate = learn_rate
-        self._history = scalar()
-        ti.root.dense(ti.i, epochs).place(self._history)
+        self._loss_history = scalar()
+        ti.root.dense(ti.i, epochs).place(self._loss_history)
 
-        batches = np.random.randint(0, samples.shape[0], size=(epochs * batch_size))
-        batches = batches.reshape(epochs, batch_size)
+        imgs = [[] for _ in range(self.fc_topology[-1])]
+        lbls = [[] for _ in range(self.fc_topology[-1])]
+
+        groups = os.listdir(dataset_path)
+        groups_num = len(groups)
+
+        for i in tqdm(range(groups_num), 
+                      file=sys.stdout, 
+                      unit=' classes ',
+                      desc='Collecting dataset: ',
+                      colour='green'):
+            group_path = os.path.join(dataset_path, groups[i])
+
+            for filename in os.listdir(group_path):
+                image_label = np.array([0. for _ in range(groups_num)], dtype=np.float32)
+                image_label[i] = 1.
+
+                image = Image.open(os.path.join(group_path, filename))
+                image_array = np.array(image.resize((64, 64)).convert('RGB'), dtype=np.float32) / 255
+
+                imgs[i].append(image_array)
+                lbls[i].append(image_label)
+
+        batches = np.array([np.random.randint(0, len(imgs[i]), size=(epochs)) for i in range(groups_num)])
 
         for epoch in tqdm(range(epochs), 
                           file=sys.stdout, 
@@ -459,75 +470,51 @@ class ConvNet:
                           desc='Training process: ',
                           colour='green'):
             self._clear_grads()
-            for sample in batches[epoch]:
-                self._copy_input(samples[sample])
-                self._copy_target(targets[sample])
+            for sample in range(groups_num):
+                self._copy_input(imgs[sample][batches[sample, epoch]])
+                self._copy_target(lbls[sample][batches[sample, epoch]])
                 # forward pass
                 self._forward()
-                self._compute_loss(epoch)
+                self._compute_loss(epoch, groups_num)
                 # backward pass
-                self._compute_loss.grad(epoch)
+                self._compute_loss.grad(epoch, groups_num)
                 self._forward.grad()
             # params correction
             self._advance()
-
+            
             ti.sync()
 
-        return self._history.to_numpy()
+        return self._loss_history.to_numpy()
 
 if __name__ == "__main__":
     net = ConvNet(
         input_size=(64, 64, 3),
-        cv_topology=[[(30, 30, 6), (3, 3)],
-                     [(14, 14, 3), (3, 3)]],
-        fc_topology=[64, 2]
+        cv_topology=[[(30, 30, 32), (3, 3)],  # max-pooling 2x2
+                     [(14, 14, 64), (3, 3)]],  # max-pooling 2x2
+        fc_topology=[256, 32, 16]
     )
-    print(net.param_count)  # 38159
+    print(net.param_count)  # 3239268
 
     # net.load_params()
 
-    dataset_path = 'dataset/cloudy'
-    scaled_images1 = []
-
-    for filename in os.listdir(dataset_path):
-        if filename.endswith('.jpg') or filename.endswith('.png'):
-            image = Image.open(os.path.join(dataset_path, filename))
-            image = image.resize((64, 64)).convert('RGB')
-            image_array = np.array(image, dtype=np.float32)
-            scaled_images1.append(image_array)
-
-    dataset_path = 'dataset/dew'
-    scaled_images2 = []
-
-    for filename in os.listdir(dataset_path):
-        if filename.endswith('.jpg') or filename.endswith('.png'):
-            image = Image.open(os.path.join(dataset_path, filename))
-            image = image.resize((64, 64)).convert('RGB')
-            image_array = np.array(image, dtype=np.float32)
-            scaled_images2.append(image_array)
-
-    dataset = np.array(scaled_images1 + scaled_images2)
-    tr1 = [[1., 0.] for _ in range(len(scaled_images1))]
-    tr2 = [[0., 1.] for _ in range(len(scaled_images2))]
-    trues = np.array(tr1 + tr2, dtype=np.float32)
-
-    print(net.predict(scaled_images1[0]))
-    print(net.predict(scaled_images2[0]))
-    print(net.predict(scaled_images1[-1]))
-    print(net.predict(scaled_images2[-1]))
-
-    history = net.train(samples=dataset[:10], 
-                        targets=trues[:10],
-                        epochs=100,
-                        batch_size=1,
-                        learn_rate=0.5)
+    history = net.train(dataset_path='dataset',
+                        epochs=10000,
+                        learn_rate=0.01)
     
     net.dump_params()
+    t_images = [
+        Image.open('dataset/cloudy/cloudy1.jpg').resize((64, 64)).convert('RGB'),
+        Image.open('dataset/dew/2208.jpg').resize((64, 64)).convert('RGB'),
+        Image.open('dataset/foggy/foggy1.jpg').resize((64, 64)).convert('RGB'),
+        Image.open('dataset/fogsmog/4075.jpg').resize((64, 64)).convert('RGB'),
+    ]
 
-    print(net.predict(scaled_images1[0]))
-    print(net.predict(scaled_images2[0]))
-    print(net.predict(scaled_images1[-1]))
-    print(net.predict(scaled_images2[-1]))
+    t_arrays = [np.array(t_image, dtype=np.float32) for t_image in t_images]
 
-    plt.plot(net._history)
+    print(net.predict(t_arrays[0]))
+    print(net.predict(t_arrays[1]))
+    print(net.predict(t_arrays[2]))
+    print(net.predict(t_arrays[3]))
+
+    plt.plot(history)
     plt.show()
