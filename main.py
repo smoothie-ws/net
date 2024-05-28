@@ -39,6 +39,7 @@ def sqd(x: real) -> real:
 @ti.func
 def BCE(ideal: real, actual: real):
     return -ideal * ti.log(actual + 1e-5) - (1 - ideal) * ti.log(1 - actual + 1e-5)
+    # return (ideal - actual) ** 2
 
 
 @ti.dataclass
@@ -183,7 +184,6 @@ class Net:
 
         ti.root.place(self._teacher)
         ti.root.place(self._loss)
-        # ti.root.dense(ti.i, self.dense_topology[-1].neurons_num).place(self._loss)
         ti.root.lazy_grad()
     
     def dump(self, url: str = 'net.model'):
@@ -333,20 +333,7 @@ class Net:
                     dsWs[l].grad[n, w] = 0.
 
     @ti.kernel
-    def _param_num(self) -> number:       
-        """Return a total number of a CNN instance's parameters
-        
-        Example::
-
-            >>> net = ConvNet(
-            >>>     input_size=(64, 64, 3),
-            >>>     conv_topology=[[(30, 30, 32), (3, 3)],
-            >>>                  [(14, 14, 64), (5, 5)]],
-            >>>     dense_topology=[512, 32, 4]
-            >>> )
-            >>> print(net.params_num)
-            >>> 6491748
-            """
+    def _param_num(self) -> number: 
         cvWs = ti.static(self.conv_weights)
         cvPs = ti.static(self.conv_params)
         dsWs = ti.static(self.dense_weights)
@@ -445,8 +432,9 @@ class Net:
         actual = ti.static(self.dense_outputs[-1])
 
         for n in actual:
-            teacher.loss[None] += BCE(ideal[n], actual[n]) / actual.shape[0]
+            teacher.loss[None] += BCE(ideal[n], actual[n])
             teacher.loss[None] += teacher[None].penalty() / self.params_num
+            teacher.loss[None] /= actual.shape[0]
 
     @ti.kernel
     def _calc_penalty(self):
@@ -528,7 +516,7 @@ class Net:
         self._forward(entry)
         return self.dense_outputs[-1].to_numpy()
 
-    def _collect_dataset(self, url: str):
+    def _collect_dataset(self, url: str, msg: str):
         imgs = []
         lbls = []
 
@@ -538,7 +526,7 @@ class Net:
         for i in tqdm(range(groups_num), 
                       file=sys.stdout, 
                       unit='classes',
-                      desc='Collecting dataset: ',
+                      desc=msg,
                       colour='green'):
             group_path = os.path.join(url, groups[i])
 
@@ -546,27 +534,27 @@ class Net:
                 image_label = np.array([0. for _ in range(groups_num)], dtype=np.float32)
                 image_label[i] = 1.
 
-                try:
-                    with Image.open(os.path.join(group_path, filename)) as image:
-                        image = image.resize((self.input_layer.size[0], 
-                                              self.input_layer.size[1]))
-                        image = image.convert('RGB')
-                        image_array = np.array(image, dtype=np.float32) / 255
+                with Image.open(os.path.join(group_path, filename)) as image:
+                    image = image.resize((self.input_layer.size[0], 
+                                            self.input_layer.size[1]))
+                    image = image.convert('RGB')
+                    image_array = np.array(image, dtype=np.float32) / 255
 
-                    imgs.append(image_array)
-                    lbls.append(image_label)
-                except:
-                    pass
+                imgs.append(image_array)
+                lbls.append(image_label)
 
         return imgs, lbls
 
-    def train(self, train_ds_url: str, 
-              val_ds_url: str, 
+    def train(self, train_dataset_url: str, 
+              val_dataset_url: str, 
               epochs: int = 10000,
               learn_rate: float = 0.005, 
               l1_lambda: float = 0.2,
               l2_lambda: float = 0.4,
               grad_threshold: float = 10.5, 
+              early_stopping: bool = True,
+              early_stopping_patience: float = 0.01,
+              early_stopping_interval: int = 1000,
               history_interval: int = 100, 
               auto_dump: bool = True,
               dump_interval: int = 2500, 
@@ -576,8 +564,8 @@ class Net:
         self._teacher[None].l1_l = l1_lambda
         self._teacher[None].l2_l = l2_lambda
 
-        train_samples, train_labels = self._collect_dataset(train_ds_url)
-        val_samples, val_labels = self._collect_dataset(val_ds_url)
+        train_samples, train_labels = self._collect_dataset(train_dataset_url, 'Collecting train dataset: ')
+        val_samples, val_labels = self._collect_dataset(val_dataset_url, 'Collecting val dataset: ')
 
         train_idxs = np.random.randint(0, len(train_samples), size=epochs)
         val_idxs = np.random.randint(0, len(val_samples), size=epochs)
@@ -616,6 +604,13 @@ class Net:
                 val_loss = loss_history[epoch // history_interval, 1]
                 progress_bar.set_postfix_str(f'Loss: {loss:0.3f}, Val loss: {val_loss:0.3f}')
 
+            if early_stopping:
+                if (epoch + 1) % early_stopping_interval == 0:
+                    curr_lost = loss_history[epoch // history_interval, 1]
+                    prev_lost = loss_history[epoch // history_interval - 1, 1]
+                    if prev_lost - curr_lost <= early_stopping_patience:
+                        break
+
             if auto_dump:
                 if (epoch + 1) % dump_interval == 0:
                     curr_lost = loss_history[epoch // history_interval, 1]
@@ -623,7 +618,7 @@ class Net:
                     if curr_lost <= prev_lost:
                         self.dump(dump_url)
 
-        return loss_history
+        return loss_history[:epoch]
     
     def compute_accuracy(self, dataset_url: str):
 
@@ -656,39 +651,42 @@ class Net:
 
 
 if __name__ == "__main__":
-    net = Net(
-        input_layer=Net.Layers.Input(size=(64, 64, 3)),
-        conv_topology=[
-            Net.Layers.Conv(Net.Kernel(32, (7, 7), step=2, padding=3)),
-            Net.Layers.Conv(Net.Kernel(32, (3, 3), step=1, padding=1), max_pool=(2, 2)),
-            Net.Layers.Conv(Net.Kernel(64, (5, 5), step=1, padding=2), max_pool=(2, 2)),
-            Net.Layers.Conv(Net.Kernel(64, (3, 3), step=1, padding=1)),
-            Net.Layers.Conv(Net.Kernel(128, (5, 5), step=2, padding=2)),
-            Net.Layers.Conv(Net.Kernel(128, (3, 3), step=1, padding=1)),
-            Net.Layers.Conv(Net.Kernel(256, (3, 3), step=1, padding=1), max_pool=(2, 2)),
-            Net.Layers.Conv(Net.Kernel(512, (3, 3), step=1, padding=1)),
-        ],
-        dense_topology=[
-            Net.Layers.Dense(neurons_num=1024),
-            Net.Layers.Dense(neurons_num=256),
-            Net.Layers.Dense(neurons_num=10)
-        ]
-    )
+    # net = Net(
+    #     input_layer=Net.Layers.Input(size=(64, 64, 3)),
+    #     conv_topology=[
+    #         Net.Layers.Conv(Net.Kernel(32, (7, 7), step=2, padding=3)),
+    #         Net.Layers.Conv(Net.Kernel(32, (3, 3), step=1, padding=1), max_pool=(2, 2)),
+    #         Net.Layers.Conv(Net.Kernel(64, (5, 5), step=1, padding=2), max_pool=(2, 2)),
+    #         Net.Layers.Conv(Net.Kernel(64, (3, 3), step=1, padding=1)),
+    #         Net.Layers.Conv(Net.Kernel(128, (5, 5), step=2, padding=2)),
+    #         Net.Layers.Conv(Net.Kernel(128, (3, 3), step=1, padding=1)),
+    #         Net.Layers.Conv(Net.Kernel(256, (3, 3), step=1, padding=1), max_pool=(2, 2)),
+    #         Net.Layers.Conv(Net.Kernel(512, (3, 3), step=1, padding=1)),
+    #     ],
+    #     dense_topology=[
+    #         Net.Layers.Dense(neurons_num=1024),
+    #         Net.Layers.Dense(neurons_num=256),
+    #         Net.Layers.Dense(neurons_num=10)
+    #     ]
+    # )
 
-    # net = Net.load('net.model')
+    net = Net.load('net.model')
 
     net.summary()
 
-    history = net.train(train_ds_url='dataset/training',
-                        val_ds_url='dataset/validation',
-                        epochs=30000,
+    history = net.train(train_dataset_url='dataset/training',
+                        val_dataset_url='dataset/validation',
+                        epochs=100000,
                         learn_rate=.0005,
                         l1_lambda=0.2,
                         l2_lambda=0.4,
-                        grad_threshold=10.5,
-                        history_interval=300,
+                        grad_threshold=5.75,
+                        early_stopping=True,
+                        early_stopping_patience=0.01,
+                        early_stopping_interval=1000,
+                        history_interval=1000,
                         auto_dump=True,
-                        dump_interval=10000,
+                        dump_interval=25000,
                         dump_url='net.model')
 
     print(net.compute_accuracy('dataset/validation'))
