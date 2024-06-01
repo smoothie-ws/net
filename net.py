@@ -9,13 +9,12 @@ from time import time
 from tqdm import tqdm
 from PIL import Image
 from tabulate import tabulate
-from matplotlib import pyplot as plt
 
 real = ti.f32
 number = ti.i32
-template = ti.template()
 scalar = lambda: ti.field(dtype=real)
 ndarray = ti.types.ndarray(dtype=real)
+
 
 ti.init(arch=ti.cuda,
         default_fp=real,
@@ -28,36 +27,24 @@ ti.init(arch=ti.cuda,
 
 @ti.func
 def sigmoid(x: real) -> real:
-    return (1 / 2) * (x / (ti.abs(x) + 1) + 1)
+    return 1 / (1 + tm.exp(-x))
 
 
 @ti.func
-def sqd(x: real) -> real:
-    return x / tm.sqrt(1 + ti.abs(x))
+def sqrtLU(x: real) -> real:
+    return x / (tm.sqrt(1 + ti.abs(x)))
+
+
+@ti.func
+def xavier_U(n_in: number, n_out: number) -> real:
+    return ti.sqrt(6 / (n_in + n_out))
 
 
 @ti.func
 def BCE(ideal: real, actual: real):
-    return -ideal * ti.log(actual + 1e-5) - (1 - ideal) * ti.log(1 - actual + 1e-5)
-    # return (ideal - actual) ** 2
-
-
-@ti.dataclass
-class ConvParams:
-    bias: real
-
-    @ti.func
-    def activate(self, weighted_sum: real) -> real:
-        return sqd(weighted_sum + self.bias)
-
-
-@ti.dataclass
-class DenseParams:
-    bias: real
-
-    @ti.func
-    def activate(self, weighted_sum: real) -> real:
-        return sigmoid(weighted_sum + self.bias)
+    lp = ideal * ti.log(actual + 1e-10)
+    rp = (1 - ideal) * ti.log(1 - actual + 1e-10)
+    return -lp - rp
 
 
 @ti.dataclass
@@ -76,10 +63,10 @@ class Teacher:
 @ti.data_oriented
 class Net:
     class Kernel:
-        def __init__(self, num: int, size: tuple = (3, 3), step: int = 1, padding: int = 1) -> None:
+        def __init__(self, num: int, size: tuple = (3, 3), stride: int = 1, padding: int = 1) -> None:
             self.num = num
             self.size = size
-            self.step = step
+            self.stride = stride
             self.padding = padding
 
     class Layers:
@@ -106,16 +93,16 @@ class Net:
 
         self.conv_maps = []
         self.conv_maps_raw = []
-        self.conv_params = []
+        self.conv_biases = []
         self.conv_weights = []
 
         self.dense_outputs = []
         self.dense_outputs_raw = []
-        self.dense_params = []
+        self.dense_biases = []
         self.dense_weights = []
 
         self._teacher = Teacher.field()
-        self._loss = scalar()
+        self._target = scalar()
 
         self._allocate()
         self._init_params()
@@ -134,29 +121,29 @@ class Net:
         for layer in self.conv_topology:
             kernels_num = layer.kernel.num
 
-            map_raw_size = ((self.conv_maps[-1].shape[0] + layer.kernel.padding * 2 - layer.kernel.size[0] + 1) // layer.kernel.step,
-                            (self.conv_maps[-1].shape[1] + layer.kernel.padding * 2 - layer.kernel.size[1] + 1) // layer.kernel.step)
+            map_raw_size = ((self.conv_maps[-1].shape[0] + layer.kernel.padding * 2 - layer.kernel.size[0] + 1) // layer.kernel.stride,
+                            (self.conv_maps[-1].shape[1] + layer.kernel.padding * 2 - layer.kernel.size[1] + 1) // layer.kernel.stride)
             map_size = (map_raw_size[0] // layer.max_pool[0], 
                         map_raw_size[1] // layer.max_pool[1])
 
             conv_map_raw = scalar()
             conv_map = scalar()
             conv_weights = scalar()
-            conv_params = ConvParams.field()
+            conv_biases = scalar()
 
             map_block = ti.root.dense(ti.k, kernels_num)
             map_block.dense(ti.ij, map_raw_size).place(conv_map_raw)
             map_block.dense(ti.ij, map_size).place(conv_map)
 
             param_block = ti.root.dense(ti.i, kernels_num)
-            param_block.place(conv_params)
+            param_block.place(conv_biases)
 
             filter_block = param_block.dense(ti.jk, layer.kernel.size)
             filter_block.dense(ti.l, self.conv_maps[-1].shape[2]).place(conv_weights)
 
             self.conv_maps_raw.append(conv_map_raw)
             self.conv_maps.append(conv_map)
-            self.conv_params.append(conv_params)
+            self.conv_biases.append(conv_biases)
             self.conv_weights.append(conv_weights)
 
         dense_output = scalar()
@@ -171,33 +158,34 @@ class Net:
             dense_output = scalar()
             dense_output_raw = scalar()
             dense_weights = scalar()
-            dense_params = DenseParams.field()
+            dense_biases = scalar()
 
             neuron_block = ti.root.dense(ti.i, neurons_num) 
-            neuron_block.place(dense_output_raw, dense_output, dense_params)
+            neuron_block.place(dense_output_raw, dense_output, dense_biases)
             neuron_block.dense(ti.j, weights_num).place(dense_weights)
 
             self.dense_outputs_raw.append(dense_output_raw)
             self.dense_outputs.append(dense_output)
-            self.dense_params.append(dense_params)
+            self.dense_biases.append(dense_biases)
             self.dense_weights.append(dense_weights)
 
+        output_size = self.dense_topology[-1].neurons_num
+        ti.root.dense(ti.i, output_size).place(self._target)
         ti.root.place(self._teacher)
-        ti.root.place(self._loss)
         ti.root.lazy_grad()
     
     def dump(self, url: str = 'net.model'):
-        conv_params = []
+        conv_biases = []
         conv_weights = []
-        dense_params = []
+        dense_biases = []
         dense_weights = []
 
         for l in range(len(self.dense_topology)):
-            dense_params.append(self.dense_params[l].to_numpy())
+            dense_biases.append(self.dense_biases[l].to_numpy())
             dense_weights.append(self.dense_weights[l].to_numpy())
 
         for l in range(len(self.conv_topology)):
-            conv_params.append(self.conv_params[l].to_numpy())
+            conv_biases.append(self.conv_biases[l].to_numpy())
             conv_weights.append(self.conv_weights[l].to_numpy())
 
         model = {
@@ -207,9 +195,9 @@ class Net:
                 'dense_topology': self.dense_topology
             },
             'dense_weights': dense_weights,
-            'dense_params': dense_params,
+            'dense_biases': dense_biases,
             'conv_weights': conv_weights,
-            'conv_params': conv_params
+            'conv_biases': conv_biases
         }
 
         with open(url, 'wb') as f:
@@ -225,17 +213,17 @@ class Net:
                    conv_topology=cfg['conv_topology'],
                    dense_topology=cfg['dense_topology'])
 
-        dense_params = model['dense_params']
+        dense_biases = model['dense_biases']
         dense_weights = model['dense_weights']
-        conv_params = model['conv_params']
+        conv_biases = model['conv_biases']
         conv_weights = model['conv_weights']
 
         for l in range(len(_net.dense_topology)):
-            _net.dense_params[l].from_numpy(dense_params[l])
+            _net.dense_biases[l].from_numpy(dense_biases[l])
             _net.dense_weights[l].from_numpy(dense_weights[l])
 
         for l in range(len(_net.conv_topology)):
-            _net.conv_params[l].from_numpy(conv_params[l])
+            _net.conv_biases[l].from_numpy(conv_biases[l])
             _net.conv_weights[l].from_numpy(conv_weights[l])
 
         return _net
@@ -245,8 +233,11 @@ class Net:
 
         for l in range(len(self.conv_topology)):
             params_num = (
-                self.conv_weights[l].shape[0] * self.conv_weights[l].shape[1] * self.conv_weights[l].shape[2] * self.conv_weights[l].shape[3]
-                + self.conv_params[l].shape[0] * 2
+                self.conv_weights[l].shape[0] 
+                * self.conv_weights[l].shape[1] 
+                * self.conv_weights[l].shape[2] 
+                * self.conv_weights[l].shape[3]
+                + self.conv_biases[l].shape[0]
             )
             input_shape = self.conv_maps[l].shape
             output_shape = self.conv_maps[l+1].shape
@@ -254,8 +245,9 @@ class Net:
 
         for l in range(len(self.dense_topology)):
             params_num = (
-                self.dense_weights[l].shape[0] * self.dense_weights[l].shape[1]
-                + self.dense_params[l].shape[0]
+                self.dense_weights[l].shape[0] 
+                * self.dense_weights[l].shape[1]
+                + self.dense_biases[l].shape[0]
             )
             input_shape = self.dense_outputs[l].shape
             output_shape = self.dense_outputs[l+1].shape
@@ -267,25 +259,25 @@ class Net:
     @ti.kernel
     def _init_params(self):
         cvWs = ti.static(self.conv_weights)
-        cvPs = ti.static(self.conv_params)
+        cvBs = ti.static(self.conv_biases)
         dsWs = ti.static(self.dense_weights)
-        dsPs = ti.static(self.dense_params)
-
-        # Xavier Normal initialization
-        for l in ti.static(range(len(cvWs))):
-            U = 4 * ti.sqrt(2 / (cvWs[l].shape[0] + cvWs[l].shape[3]))
-            for k in range(cvWs[l].shape[0]):
-                cvPs[l][k].bias = 0.
-                for kX, kY, kZ in ti.ndrange(cvWs[l].shape[1],
-                                             cvWs[l].shape[2],
-                                             cvWs[l].shape[3]):
-                    cvWs[l][k, kX, kY, kZ] = ti.randn(real) * U
+        dsBs = ti.static(self.dense_biases)
 
         # Xavier Uniform initialization
+
+        for l in ti.static(range(len(cvWs))):
+            N = xavier_U(cvWs[l].shape[0], cvWs[l].shape[3])
+            for k in range(cvWs[l].shape[0]):
+                cvBs[l][k] = 0.
+                for kX, kY, kZ in ti.ndrange(cvWs[l].shape[1],
+                                                cvWs[l].shape[2],
+                                                cvWs[l].shape[3]):
+                    cvWs[l][k, kX, kY, kZ] = ti.randn(real) * N
+
         for l in ti.static(range(len(dsWs))):
-            N = ti.sqrt(2 / dsWs[l].shape[1])
+            N = xavier_U(dsWs[l].shape[0], dsWs[l].shape[1])
             for n in range(dsWs[l].shape[0]):
-                dsPs[l][n].bias = 0.
+                dsBs[l][n] = 0.
                 for w in range(dsWs[l].shape[1]):
                     dsWs[l][n, w] = ti.randn(real) * N
 
@@ -294,11 +286,11 @@ class Net:
         cvMs = ti.static(self.conv_maps)
         cvMs_raw = ti.static(self.conv_maps_raw)
         cvWs = ti.static(self.conv_weights)
-        cvPs = ti.static(self.conv_params)
+        cvBs = ti.static(self.conv_biases)
         dsOs = ti.static(self.dense_outputs)
         dsOs_raw = ti.static(self.dense_outputs_raw)
         dsWs = ti.static(self.dense_weights)
-        dsPs = ti.static(self.dense_params)
+        dsBs = ti.static(self.dense_biases)
 
         self._teacher[None].l1 = 0.
         self._teacher.grad[None].l1 = 0.
@@ -312,7 +304,7 @@ class Net:
             cvMs[0].grad[M] = 0.
         for l in ti.static(range(len(cvMs_raw))):
             for k in range(cvWs[l].shape[0]):
-                cvPs[l].grad[k].bias = 0.
+                cvBs[l].grad[k] = 0.
                 for mX, mY in ti.ndrange(cvMs_raw[l].shape[0],
                                          cvMs_raw[l].shape[1]):
                     cvMs[l+1].grad[mX, mY, k] = 0.
@@ -326,48 +318,55 @@ class Net:
             dsOs[0].grad[n] = 0.
         for l in ti.static(range(len(self.dense_topology))):
             for n in range(dsWs[l].shape[0]):
+                dsBs[l].grad[n] = 0.
                 dsOs[l+1].grad[n] = 0.
                 dsOs_raw[l].grad[n] = 0.
-                dsPs[l].grad[n].bias = 0.
                 for w in range(dsWs[l].shape[1]):
                     dsWs[l].grad[n, w] = 0.
 
     @ti.kernel
     def _param_num(self) -> number: 
         cvWs = ti.static(self.conv_weights)
-        cvPs = ti.static(self.conv_params)
+        cvBs = ti.static(self.conv_biases)
         dsWs = ti.static(self.dense_weights)
-        dsPs = ti.static(self.dense_params)
+        dsBs = ti.static(self.dense_biases)
 
         total = 0
 
         for l in ti.static(range(len(self.conv_topology))):
             total += cvWs[l].shape[0] * cvWs[l].shape[1] * cvWs[l].shape[2] * cvWs[l].shape[3]
-            total += cvPs[l].shape[0]
+            total += cvBs[l].shape[0]
 
         for l in ti.static(range(len(self.dense_topology))):
             total += dsWs[l].shape[0] * dsWs[l].shape[1]
-            total += dsPs[l].shape[0]
+            total += dsBs[l].shape[0]
 
         return total
 
     @ti.kernel
-    def _forward(self, entry: ndarray):
+    def _copy_entry(self, entry: ndarray):
+        for I in ti.grouped(self.conv_maps[0]):
+            self.conv_maps[0][I] = entry[I]
+
+    @ti.kernel
+    def _copy_target(self, target: ndarray):
+        for n in self._target:
+            self._target[n] = target[n]
+
+    @ti.kernel
+    def _forward(self):
         cvMs = ti.static(self.conv_maps)
         cvMs_raw = ti.static(self.conv_maps_raw)
         cvWs = ti.static(self.conv_weights)
-        cvPs = ti.static(self.conv_params)
+        cvBs = ti.static(self.conv_biases)
         dsOs = ti.static(self.dense_outputs)
         dsOs_raw = ti.static(self.dense_outputs_raw)
         dsWs = ti.static(self.dense_weights)
-        dsPs = ti.static(self.dense_params)
-
-        for I in ti.grouped(cvMs[0]):
-            cvMs[0][I] = entry[I]
+        dsBs = ti.static(self.dense_biases)
 
         # loop over conv layers
         for l in ti.static(range(len(cvMs_raw))):
-            step = ti.static(self.conv_topology[l].kernel.step)
+            stride = ti.static(self.conv_topology[l].kernel.stride)
             padding = ti.static(self.conv_topology[l].kernel.padding)
             # X compression factor
             mpX = ti.static(self.conv_topology[l].max_pool[0])
@@ -380,10 +379,10 @@ class Net:
                 cvMs_raw[l][O] = 0.
                 # loop over filter coords (x, y, z)
                 for kX, kY, kZ in ti.ndrange(cvWs[l].shape[1],
-                                             cvWs[l].shape[2],
-                                             cvWs[l].shape[3]):
-                    iX = O.x * step - padding + kX  # input X
-                    iY = O.y * step - padding + kY  # input Y
+                                                cvWs[l].shape[2],
+                                                cvWs[l].shape[3]):
+                    iX = O.x * stride - padding + kX  # input X
+                    iY = O.y * stride - padding + kY  # input Y
                     if (0 <= iX < cvMs[l].shape[0]) and (0 <= iY < cvMs[l].shape[1]):
                         cvMs_raw[l][O] += cvWs[l][O.z, kX, kY, kZ] * cvMs[l][iX, iY, kZ]
 
@@ -395,8 +394,9 @@ class Net:
                 for cX, cY in ti.ndrange(mpX, mpY):
                     rX = M.x * mpX + cX  # raw X
                     rY = M.y * mpY + cY  # raw Y
-                    # activation + max pooling inlined
-                    a = cvPs[l][M.z].activate(cvMs_raw[l][rX, rY, M.z])
+                    # activation
+                    a = sqrtLU(cvMs_raw[l][rX, rY, M.z] + cvBs[l][M.z])
+                    # max pooling
                     _max = ti.max(_max, a)
                 cvMs[l+1][M] = _max
 
@@ -415,105 +415,104 @@ class Net:
                 # loop over neuron weights
                 for w in range(dsWs[l].shape[1]):
                     dsOs_raw[l][n] += dsWs[l][n, w] * dsOs[l][w]
-
             # loop over neurons
             # to activate the weighted sum
-            if ti.static(l < len(dsWs) - 1):
-                for n in dsOs_raw[l]:
-                    # sigmoid activation
-                    dsOs[l+1][n] = sqd(dsPs[l][n].bias + dsOs_raw[l][n])
-            if ti.static(l == len(dsWs) - 1):
-                for n in dsOs_raw[l]:
-                    dsOs[l+1][n] = sigmoid(dsPs[l][n].bias + dsOs_raw[l][n])
-
-    @ti.kernel
-    def _compute_loss(self, ideal: ndarray):
-        teacher = ti.static(self._teacher)
-        actual = ti.static(self.dense_outputs[-1])
-
-        for n in actual:
-            teacher.loss[None] += BCE(ideal[n], actual[n])
-            teacher.loss[None] += teacher[None].penalty() / self.params_num
-            teacher.loss[None] /= actual.shape[0]
+            for n in dsOs_raw[l]:
+                dsOs[l+1][n] = sigmoid(dsBs[l][n] + dsOs_raw[l][n])
 
     @ti.kernel
     def _calc_penalty(self):
         teacher = ti.static(self._teacher)
-        cvPs = ti.static(self.conv_params)
+        cvBs = ti.static(self.conv_biases)
         cvWs = ti.static(self.conv_weights)
-        dsPs = ti.static(self.dense_params)
+        dsBs = ti.static(self.dense_biases)
         dsWs = ti.static(self.dense_weights)
 
         for l in ti.static(range(len(cvWs))):
-            for B in ti.grouped(cvPs[l]):
-                teacher[None].l1 += ti.abs(cvPs[l][B].bias)
-                teacher[None].l2 += cvPs[l][B].bias ** 2
+            for B in ti.grouped(cvBs[l]):
+                teacher[None].l1 += ti.abs(cvBs[l][B])
+                teacher[None].l2 += cvBs[l][B] ** 2
             for K in ti.grouped(cvWs[l]):
                 teacher[None].l1 += ti.abs(cvWs[l][K])
                 teacher[None].l2 += cvWs[l][K] ** 2
 
         for l in ti.static(range(len(dsWs))):
-            for N in ti.grouped(dsPs[l]):
-                teacher[None].l1 += ti.abs(dsPs[l][N].bias)
-                teacher[None].l2 += dsPs[l][N].bias ** 2
+            for N in ti.grouped(dsBs[l]):
+                teacher[None].l1 += ti.abs(dsBs[l][N])
+                teacher[None].l2 += dsBs[l][N] ** 2
             for W in ti.grouped(dsWs[l]):
                 teacher[None].l1 += ti.abs(dsWs[l][W])
                 teacher[None].l2 += dsWs[l][W] ** 2
 
+    @ti.kernel
+    def _compute_loss(self, batch_size: number):
+        teacher = ti.static(self._teacher)
+        actual = ti.static(self.dense_outputs[-1])
+        ideal = ti.static(self._target)
+
+        for n in actual:
+            loss = BCE(ideal[n], actual[n])
+            penalty = teacher[None].penalty() / self.params_num / actual.shape[0]
+            teacher[None].loss += (loss + penalty) / batch_size
+
     @ti.func
     def _calc_grad_clip(self, grad_threshold: real) -> real:
-        cvPs = ti.static(self.conv_params)
+        cvBs = ti.static(self.conv_biases)
         cvWs = ti.static(self.conv_weights)
         dsWs = ti.static(self.dense_weights)
-        dsPs = ti.static(self.dense_params)
+        dsBs = ti.static(self.dense_biases)
 
         grad_sum = 0.
 
         for l in ti.static(range(len(cvWs))):
             for k in range(cvWs[l].shape[0]):
-                grad_sum += cvPs[l].grad[k].bias ** 2
+                grad_sum += cvBs[l].grad[k] ** 2
                 for kX, kY, kZ in ti.ndrange(cvWs[l].shape[1],
-                                             cvWs[l].shape[2],
-                                             cvWs[l].shape[3]):
+                                                cvWs[l].shape[2],
+                                                cvWs[l].shape[3]):
                     grad_sum += cvWs[l].grad[k, kX, kY, kZ] ** 2
 
         for l in ti.static(range(len(dsWs))):
             for n in range(dsWs[l].shape[0]):
-                grad_sum += dsPs[l].grad[n].bias ** 2 
+                grad_sum += dsBs[l].grad[n] ** 2 
                 for w in range(dsWs[l].shape[1]):
                     grad_sum += dsWs[l].grad[n, w] ** 2
 
-        return tm.clamp(grad_threshold / grad_sum, 0., 1.)
+        grad_l2 = tm.sqrt(grad_sum)
+        grad_clip = grad_threshold / grad_l2
+
+        return tm.clamp(grad_clip, 0., 1.)
 
     @ti.kernel
-    def _advance(self, lr: real, grad_threshold: real):
-        cvPs = ti.static(self.conv_params)
+    def _advance(self, learn_rate: real, grad_threshold: real):
+        cvBs = ti.static(self.conv_biases)
         cvWs = ti.static(self.conv_weights)
         dsWs = ti.static(self.dense_weights)
-        dsPs = ti.static(self.dense_params)
+        dsBs = ti.static(self.dense_biases)
 
         grad_clip = self._calc_grad_clip(grad_threshold)
 
         for l in ti.static(range(len(cvWs))):
             for k in range(cvWs[l].shape[0]):
-                dL_dB = cvPs[l].grad[k].bias
-                cvPs[l][k].bias -= lr * dL_dB * grad_clip
+                dL_dB = cvBs[l].grad[k] * grad_clip
+                cvBs[l][k] -= learn_rate * dL_dB
                 for kX, kY, kZ in ti.ndrange(cvWs[l].shape[1], 
                                              cvWs[l].shape[2],
                                              cvWs[l].shape[3]):
-                    dL_dW = cvWs[l].grad[k, kX, kY, kZ]
-                    cvWs[l][k, kX, kY, kZ] -= lr * dL_dW * grad_clip
+                    dL_dW = cvWs[l].grad[k, kX, kY, kZ] * grad_clip
+                    cvWs[l][k, kX, kY, kZ] -= learn_rate * dL_dW
 
         for l in ti.static(range(len(dsWs))):
             for n in range(dsWs[l].shape[0]):
-                dL_dB = dsPs[l].grad[n].bias
-                dsPs[l][n].bias -= lr * dL_dB * grad_clip
+                dL_dB = dsBs[l].grad[n] * grad_clip
+                dsBs[l][n] -= learn_rate * dL_dB
                 for w in range(dsWs[l].shape[1]):
-                    dL_dW = dsWs[l].grad[n, w]
-                    dsWs[l][n, w] -= lr * dL_dW * grad_clip
+                    dL_dW = dsWs[l].grad[n, w] * grad_clip
+                    dsWs[l][n, w] -= learn_rate * dL_dW
 
     def predict(self, entry: np.ndarray) -> np.ndarray:
-        self._forward(entry)
+        self._copy_entry(entry)
+        self._forward()
         return self.dense_outputs[-1].to_numpy()
 
     def _collect_dataset(self, url: str, msg: str):
@@ -524,172 +523,125 @@ class Net:
         groups_num = len(groups)
 
         for i in tqdm(range(groups_num), 
-                      file=sys.stdout, 
-                      unit='classes',
-                      desc=msg,
-                      colour='green'):
+                        file=sys.stdout, 
+                        unit='classes',
+                        desc=msg,
+                        colour='green'):
             group_path = os.path.join(url, groups[i])
+            group_label = np.array([0. for _ in range(groups_num)], dtype=np.float32)
+            group_label[i] = 1.
 
             for filename in os.listdir(group_path):
-                image_label = np.array([0. for _ in range(groups_num)], dtype=np.float32)
-                image_label[i] = 1.
-
                 with Image.open(os.path.join(group_path, filename)) as image:
-                    image = image.resize((self.input_layer.size[0], 
-                                            self.input_layer.size[1]))
-                    image = image.convert('RGB')
-                    image_array = np.array(image, dtype=np.float32) / 255
+                    image = image.resize((self.input_layer.size[:2]))
+
+                image = image.convert('RGB')
+                image_array = np.array(image, dtype=np.float32) / 255
 
                 imgs.append(image_array)
-                lbls.append(image_label)
+                lbls.append(group_label)
 
         return imgs, lbls
+    
+    def compute_preds_matrix(self, dataset_url: str):
 
-    def train(self, train_dataset_url: str, 
-              val_dataset_url: str, 
+        groups = os.listdir(dataset_url)
+        groups_num = len(groups)
+
+        results = np.zeros(shape=(groups_num, groups_num), dtype=np.float32)
+
+        for i in tqdm(range(groups_num), 
+                        file=sys.stdout, 
+                        unit='classes',
+                        desc='Validation progress: ',
+                        colour='blue'):
+            group_path = os.path.join(dataset_url, groups[i])
+            group_samples_num = len(os.listdir(group_path))
+
+            for sample in range(group_samples_num):
+                with Image.open(os.path.join(group_path, os.listdir(group_path)[sample])) as image:
+                    image = image.resize((self.input_layer.size[:2]))
+
+                image = image.convert('RGB')
+                image_array = np.array(image, dtype=np.float32) / 255
+            
+                results[i] += self.predict(image_array)
+
+            results[i] /= group_samples_num
+
+        return results
+
+    def train(self, train_ds_url: str, 
+              val_ds_url: str, 
               epochs: int = 10000,
+              batch_size: int = 8,
+              history_interval: int = 100,
               learn_rate: float = 0.005, 
               l1_lambda: float = 0.2,
               l2_lambda: float = 0.4,
               grad_threshold: float = 10.5, 
-              early_stopping: bool = True,
-              early_stopping_patience: float = 0.01,
-              early_stopping_interval: int = 1000,
-              history_interval: int = 100, 
               auto_dump: bool = True,
               dump_interval: int = 2500, 
               dump_url: str = 'net.model'):
 
         loss_history = np.zeros(shape=(epochs // history_interval, 2))
+
         self._teacher[None].l1_l = l1_lambda
         self._teacher[None].l2_l = l2_lambda
 
-        train_samples, train_labels = self._collect_dataset(train_dataset_url, 'Collecting train dataset: ')
-        val_samples, val_labels = self._collect_dataset(val_dataset_url, 'Collecting val dataset: ')
+        train_samples, train_labels = self._collect_dataset(train_ds_url, 'Collecting train dataset: ')
+        train_idxs = [np.random.randint(0, len(train_samples), size=batch_size) for _ in range(epochs)]
 
-        train_idxs = np.random.randint(0, len(train_samples), size=epochs)
-        val_idxs = np.random.randint(0, len(val_samples), size=epochs)
+        val_samples, val_labels = self._collect_dataset(val_ds_url, 'Collecting val dataset: ')
+        val_idxs = [np.random.randint(0, len(val_samples), size=batch_size) for _ in range(epochs)]
 
-        progress_bar = tqdm(range(epochs), 
-                  file=sys.stdout, 
-                  unit='epochs',
-                  desc=f'Training progress: ',
-                  colour='green')
-        for epoch in progress_bar:
-            train_idx = train_idxs[epoch]
-            val_idx = val_idxs[epoch]
+        train_progress_bar = tqdm(range(epochs),
+                                  file=sys.stdout, 
+                                  unit='epochs', 
+                                  desc='Training progress',
+                                  colour='green')
+        for epoch in train_progress_bar:
+            self._clear_grads()
+            self._calc_penalty()
+
+            for i in val_idxs[epoch]:
+                self._copy_entry(val_samples[i])
+                self._copy_target(val_labels[i])
+                self._forward()
+                self._compute_loss(batch_size)
+
+            val_loss = self._teacher[None].loss
 
             self._clear_grads()
-            self._forward(train_samples[train_idx])
             self._calc_penalty()
-            self._compute_loss(train_labels[train_idx])
-            self._compute_loss.grad(train_labels[train_idx])
+
+            for i in train_idxs[epoch]:
+                self._copy_entry(train_samples[i])
+                self._copy_target(train_labels[i])
+                self._forward()
+                self._compute_loss(batch_size)
+
+            self._compute_loss.grad(batch_size)
+            self._forward.grad()
             self._calc_penalty.grad()
-            self._forward.grad(train_samples[train_idx])
+
             self._advance(learn_rate, grad_threshold)
 
-            loss = self._teacher[None].loss / history_interval
-            loss_history[epoch // history_interval, 0] += loss
+            train_loss = self._teacher[None].loss
 
-            self._clear_grads()
-            self._forward(val_samples[val_idx])
-            self._calc_penalty()
-            self._compute_loss(val_labels[val_idx])
-
-            loss = self._teacher[None].loss / history_interval
-            loss_history[epoch // history_interval, 1] += loss
+            loss_history[epoch // history_interval, 0] += train_loss / history_interval
+            loss_history[epoch // history_interval, 1] += val_loss / history_interval
 
             if (epoch + 1) % history_interval == 0:
-                loss = loss_history[epoch // history_interval, 0]
-                val_loss = loss_history[epoch // history_interval, 1]
-                progress_bar.set_postfix_str(f'Loss: {loss:0.3f}, Val loss: {val_loss:0.3f}')
-
-            if early_stopping:
-                if (epoch + 1) % early_stopping_interval == 0:
-                    curr_lost = loss_history[epoch // history_interval, 1]
-                    prev_lost = loss_history[epoch // history_interval - 1, 1]
-                    if prev_lost - curr_lost <= early_stopping_patience:
-                        break
+                tl = loss_history[epoch // history_interval, 0]
+                vl = loss_history[epoch // history_interval, 1]
+                train_progress_bar.set_postfix_str(f'loss: {tl:0.3f}, val_loss: {vl:0.3f}')
 
             if auto_dump:
                 if (epoch + 1) % dump_interval == 0:
-                    curr_lost = loss_history[epoch // history_interval, 1]
-                    prev_lost = loss_history[epoch // history_interval - 1, 1]
+                    curr_lost = loss_history[epoch // history_interval, 0]
+                    prev_lost = loss_history[epoch // history_interval - 1, 0]
                     if curr_lost <= prev_lost:
                         self.dump(dump_url)
 
-        return loss_history[:epoch]
-    
-    def compute_accuracy(self, dataset_url: str):
-
-        groups = os.listdir(dataset_url)
-        groups_num = len(groups)
-
-        results = np.zeros(shape=groups_num, dtype=np.float16)
-
-        for i in tqdm(range(groups_num), 
-                      file=sys.stdout, 
-                      unit=' classes ',
-                      desc='Validation progress: ',
-                      colour='blue'):
-            group_path = os.path.join(dataset_url, groups[i])
-            group_samples_num = len(os.listdir(group_path))
-            group_res = np.zeros(group_samples_num, dtype=np.float16)
-
-            for sample in range(group_samples_num):
-                with Image.open(os.path.join(group_path, os.listdir(group_path)[sample])) as image:
-                    image = image.resize((self.input_layer.size[0], self.input_layer.size[1]))
-                    image = image.convert('RGB')
-                    image_array = np.array(image, dtype=np.float32) / 255
-
-                    self._forward(image_array)
-                    group_res[sample] = self.dense_outputs[-1].to_numpy().argmax()
-            
-            results[i] = np.sum(group_res == i) / group_samples_num
-
-        return results
-
-
-if __name__ == "__main__":
-    # net = Net(
-    #     input_layer=Net.Layers.Input(size=(64, 64, 3)),
-    #     conv_topology=[
-    #         Net.Layers.Conv(Net.Kernel(32, (7, 7), step=2, padding=3)),
-    #         Net.Layers.Conv(Net.Kernel(32, (3, 3), step=1, padding=1), max_pool=(2, 2)),
-    #         Net.Layers.Conv(Net.Kernel(64, (5, 5), step=1, padding=2), max_pool=(2, 2)),
-    #         Net.Layers.Conv(Net.Kernel(64, (3, 3), step=1, padding=1)),
-    #         Net.Layers.Conv(Net.Kernel(128, (5, 5), step=2, padding=2)),
-    #         Net.Layers.Conv(Net.Kernel(128, (3, 3), step=1, padding=1)),
-    #         Net.Layers.Conv(Net.Kernel(256, (3, 3), step=1, padding=1), max_pool=(2, 2)),
-    #         Net.Layers.Conv(Net.Kernel(512, (3, 3), step=1, padding=1)),
-    #     ],
-    #     dense_topology=[
-    #         Net.Layers.Dense(neurons_num=1024),
-    #         Net.Layers.Dense(neurons_num=256),
-    #         Net.Layers.Dense(neurons_num=10)
-    #     ]
-    # )
-
-    net = Net.load('net.model')
-
-    net.summary()
-
-    history = net.train(train_dataset_url='dataset/training',
-                        val_dataset_url='dataset/validation',
-                        epochs=100000,
-                        learn_rate=.0005,
-                        l1_lambda=0.2,
-                        l2_lambda=0.4,
-                        grad_threshold=5.75,
-                        early_stopping=True,
-                        early_stopping_patience=0.01,
-                        early_stopping_interval=1000,
-                        history_interval=1000,
-                        auto_dump=True,
-                        dump_interval=25000,
-                        dump_url='net.model')
-
-    print(net.compute_accuracy('dataset/validation'))
-
-    plt.plot(history)
-    plt.show()
+        return loss_history
